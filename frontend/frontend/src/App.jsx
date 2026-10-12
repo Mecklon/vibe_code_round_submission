@@ -43,10 +43,10 @@ async function apiRequest(path, options = {}) {
   return body
 }
 
-async function streamMessage(conversationId, message, tonePreference, onToken) {
+async function streamMessage(path, body, onToken) {
   if (!csrfCookie()) await refreshCsrfToken()
 
-  const response = await fetch(`${API_URL}/api/conversations/${conversationId}/messages`, {
+  const response = await fetch(`${API_URL}${path}`, {
     method: 'POST',
     credentials: 'include',
     headers: {
@@ -54,7 +54,7 @@ async function streamMessage(conversationId, message, tonePreference, onToken) {
       'X-XSRF-TOKEN': csrfCookie(),
       Accept: 'text/event-stream',
     },
-    body: JSON.stringify({ message, tonePreference }),
+    body: JSON.stringify(body),
   })
 
   if (!response.ok) {
@@ -114,6 +114,7 @@ function App() {
   const [draft, setDraft] = useState('')
   const [tone, setTone] = useState('PROFESSIONAL')
   const [streaming, setStreaming] = useState(false)
+  const [copiedMessage, setCopiedMessage] = useState(null)
   const conversationEndRef = useRef(null)
 
   useEffect(() => {
@@ -228,7 +229,10 @@ function App() {
       }))
 
       let streamedText = ''
-      await streamMessage(conversation.id, message, tone, (chunk) => {
+      await streamMessage(`/api/conversations/${conversation.id}/messages`, {
+        message,
+        tonePreference: tone,
+      }, (chunk) => {
         streamedText += chunk
         setActiveConversation((current) => {
           if (!current) return current
@@ -256,6 +260,59 @@ function App() {
             content: 'This reply was interrupted. Your message is saved; please try again.',
           }
         }
+        return { ...current, messages }
+      })
+    } finally {
+      setStreaming(false)
+    }
+  }
+
+  async function copyReply(content, index) {
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopiedMessage(index)
+      window.setTimeout(() => setCopiedMessage(null), 1600)
+    } catch {
+      setError('Could not copy this response. Check your browser clipboard permissions.')
+    }
+  }
+
+  async function regenerateReply(conversation, index) {
+    if (streaming) return
+
+    const answer = conversation.messages[index]
+    setError('')
+    setStreaming(true)
+    setCopiedMessage(null)
+    setActiveConversation((current) => {
+      if (!current) return current
+      const messages = [...current.messages]
+      messages[index] = { ...messages[index], content: '' }
+      return { ...current, messages }
+    })
+
+    let streamedText = ''
+    try {
+      await streamMessage(`/api/conversations/${conversation.id}/regenerate`, {}, (chunk) => {
+        streamedText += chunk
+        setActiveConversation((current) => {
+          if (!current) return current
+          const messages = [...current.messages]
+          messages[index] = { ...messages[index], content: streamedText }
+          return { ...current, messages }
+        })
+      })
+      const refreshed = await apiRequest(`/api/conversations/${conversation.id}`)
+      setActiveConversation(refreshed)
+      setConversations((items) => items.map((item) => item.id === conversation.id
+        ? { ...item, updatedAt: refreshed.updatedAt }
+        : item))
+    } catch (requestError) {
+      setError(requestError.message)
+      setActiveConversation((current) => {
+        if (!current) return current
+        const messages = [...current.messages]
+        messages[index] = { ...messages[index], content: streamedText || answer.content }
         return { ...current, messages }
       })
     } finally {
@@ -373,6 +430,20 @@ function App() {
                       <p>{message.content || (streaming && index === activeConversation.messages.length - 1
                         ? <span className="typing-indicator"><i /><i /><i /></span>
                         : '')}</p>
+                      {message.role === 'assistant' && message.content && (
+                        <div className="reply-actions">
+                          <button type="button" onClick={() => copyReply(message.content, index)}>
+                            <CopyIcon />{copiedMessage === index ? 'Copied' : 'Copy'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={streaming || index !== activeConversation.messages.length - 1}
+                            onClick={() => regenerateReply(activeConversation, index)}
+                          >
+                            <RefreshIcon />More articulate
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </article>
                 ))}
@@ -570,6 +641,24 @@ function LogoutIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <path d="M8 4H4.5A1.5 1.5 0 0 0 3 5.5v9A1.5 1.5 0 0 0 4.5 16H8m4-3 3-3-3-3m3 3H7" />
+    </svg>
+  )
+}
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="5" y="5" width="8" height="9" rx="1.5" />
+      <path d="M10.5 5V3.5A1.5 1.5 0 0 0 9 2H4.5A1.5 1.5 0 0 0 3 3.5V9a1.5 1.5 0 0 0 1.5 1.5H5" />
+    </svg>
+  )
+}
+
+function RefreshIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M13 5.5V2.8l-1.7 1.7A5.5 5.5 0 0 0 3 6m0 4.5v2.7l1.7-1.7A5.5 5.5 0 0 0 13 10" />
+      <path d="M3 6h2m6 4h2" />
     </svg>
   )
 }

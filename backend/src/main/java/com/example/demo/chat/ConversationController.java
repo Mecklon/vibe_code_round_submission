@@ -48,4 +48,9 @@ public class ConversationController {
 			Authentication authentication) {
 		return conversationService.sendMessage(authentication.getName(), id, request);
 	}
+
+	@PostMapping(value = "/{id}/regenerate", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+	public SseEmitter regenerateMoreArticulate(@PathVariable String id, Authentication authentication) {
+		return conversationService.regenerateMoreArticulate(authentication.getName(), id);
+	}
 }

@@ -83,17 +83,61 @@ public class ConversationService {
 		conversations.save(conversation);
 
 		SseEmitter emitter = new SseEmitter(180_000L);
-		CompletableFuture.runAsync(() -> streamReply(conversation, message, request.tonePreference(), emitter));
+		CompletableFuture.runAsync(() -> streamReply(conversation, message, request.tonePreference(), emitter,
+				false, false, null));
 		return emitter;
 	}
 
-	private void streamReply(Conversation conversation, String userMessage, ResponseTone tone, SseEmitter emitter) {
+	public SseEmitter regenerateMoreArticulate(String email, String id) {
+		if (!providerConfigured) {
+			throw new ChatProviderNotConfiguredException();
+		}
+
+		Conversation conversation = findOwnedConversation(email, id);
+		List<ConversationMessage> messages = conversation.getMessages();
+		if (messages.size() < 2
+				|| !"assistant".equals(messages.get(messages.size() - 1).role())
+				|| !"user".equals(messages.get(messages.size() - 2).role())) {
+			throw new IllegalStateException("The latest response cannot be regenerated");
+		}
+
+		String originalResponse = messages.get(messages.size() - 1).content();
+		String userMessage = messages.get(messages.size() - 2).content();
+		List<Message> priorMessages = messages.subList(0, messages.size() - 1).stream()
+				.map(ConversationService::toSpringMessage)
+				.toList();
+		chatMemory.clear(conversation.getId());
+		chatMemory.add(conversation.getId(), priorMessages);
+
+		SseEmitter emitter = new SseEmitter(180_000L);
+		ResponseTone tone = conversation.getTonePreference() == null
+				? authService.findByEmail(email).getTonePreference()
+				: conversation.getTonePreference();
+		CompletableFuture.runAsync(() -> streamReply(conversation, userMessage, tone,
+				emitter, true, true, originalResponse));
+		return emitter;
+	}
+
+	private void streamReply(
+			Conversation conversation,
+			String userMessage,
+			ResponseTone tone,
+			SseEmitter emitter,
+			boolean userAlreadyInMemory,
+			boolean regenerate,
+			String originalResponse) {
 		StringBuilder answer = new StringBuilder();
 		try {
 			List<Message> promptMessages = new ArrayList<>();
 			promptMessages.add(new SystemMessage(systemInstruction(tone)));
+			if (regenerate) {
+				promptMessages.add(new SystemMessage(
+						"Rewrite your previous response to be more articulate, polished, and clear while preserving its meaning and useful details. Do not mention that this is a rewrite."));
+			}
 			promptMessages.addAll(chatMemory.get(conversation.getId()));
-			promptMessages.add(new UserMessage(userMessage));
+			if (!userAlreadyInMemory) {
+				promptMessages.add(new UserMessage(userMessage));
+			}
 
 			try (Stream<String> chunks = chatClient.prompt()
 					.messages(promptMessages.toArray(Message[]::new))
@@ -111,14 +155,26 @@ public class ConversationService {
 			}
 
 			String response = answer.toString();
-			chatMemory.add(conversation.getId(), List.of(new UserMessage(userMessage), new AssistantMessage(response)));
-			conversation.addMessage(new ConversationMessage("assistant", response, Instant.now()));
+			if (userAlreadyInMemory) {
+				chatMemory.add(conversation.getId(), List.of(new AssistantMessage(response)));
+			} else {
+				chatMemory.add(conversation.getId(), List.of(new UserMessage(userMessage), new AssistantMessage(response)));
+			}
+			ConversationMessage assistantMessage = new ConversationMessage("assistant", response, Instant.now());
+			if (regenerate) {
+				conversation.replaceLastAssistantMessage(assistantMessage);
+			} else {
+				conversation.addMessage(assistantMessage);
+			}
 			conversation.setUpdatedAt(Instant.now());
 			conversations.save(conversation);
 			emitter.send(SseEmitter.event().name("done").data("[DONE]"));
 			emitter.complete();
 		} catch (Exception exception) {
 			logger.error("Chat generation failed for conversation {}", conversation.getId(), exception);
+			if (regenerate && originalResponse != null) {
+				restoreChatMemory(conversation);
+			}
 			try {
 				emitter.send(SseEmitter.event().name("error")
 						.data("Could not complete this reply. Check your AI provider settings and try again."));
@@ -128,6 +184,25 @@ public class ConversationService {
 			}
 			emitter.completeWithError(exception);
 		}
+	}
+
+	private void restoreChatMemory(Conversation conversation) {
+		try {
+			chatMemory.clear(conversation.getId());
+			chatMemory.add(conversation.getId(), conversation.getMessages().stream()
+					.map(ConversationService::toSpringMessage)
+					.toList());
+		} catch (Exception exception) {
+			logger.error("Could not restore chat memory for conversation {}", conversation.getId(), exception);
+		}
+	}
+
+	private static Message toSpringMessage(ConversationMessage message) {
+		return switch (message.role()) {
+			case "user" -> new UserMessage(message.content());
+			case "assistant" -> new AssistantMessage(message.content());
+			default -> throw new IllegalArgumentException("Unsupported conversation message role");
+		};
 	}
 
 	private Conversation findOwnedConversation(String email, String id) {

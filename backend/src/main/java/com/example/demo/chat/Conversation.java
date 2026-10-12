@@ -80,4 +80,12 @@ public class Conversation {
 		}
 		messages.add(message);
 	}
+
+	public void replaceLastAssistantMessage(ConversationMessage message) {
+		if (messages == null || messages.isEmpty()
+				|| !"assistant".equals(messages.get(messages.size() - 1).role())) {
+			throw new IllegalStateException("Conversation does not end with an assistant message");
+		}
+		messages.set(messages.size() - 1, message);
+	}
 }
